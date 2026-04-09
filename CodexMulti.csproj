@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CodexMulti</AssemblyName>
+    <RootNamespace>CodexMulti</RootNamespace>
+    <OutputName>codex-multi</OutputName>
+    <LangVersion>12.0</LangVersion>
+  </PropertyGroup>
+</Project>
