@@ -2,24 +2,28 @@ using CodexMulti.Auth;
 using CodexMulti.Configuration;
 using CodexMulti.Infrastructure;
 using CodexMulti.Profiles;
-using CodexMulti.Sessions;
 
 namespace CodexMulti.Run;
 
 internal sealed class CodexMultiRunner
 {
+    private static readonly TimeSpan StateLockTimeout = TimeSpan.FromSeconds(30);
+
     private readonly AppConfigStore _configStore;
+    private readonly RuntimeStateStore _runtimeStateStore;
     private readonly ProfileStore _profileStore;
     private readonly AuthJsonSwitcher _authSwitcher;
     private readonly AppLogger _logger;
 
     public CodexMultiRunner(
         AppConfigStore configStore,
+        RuntimeStateStore runtimeStateStore,
         ProfileStore profileStore,
         AuthJsonSwitcher authSwitcher,
         AppLogger logger)
     {
         _configStore = configStore;
+        _runtimeStateStore = runtimeStateStore;
         _profileStore = profileStore;
         _authSwitcher = authSwitcher;
         _logger = logger;
@@ -27,41 +31,20 @@ internal sealed class CodexMultiRunner
 
     public async Task<int> RunAsync(IReadOnlyList<string> args)
     {
-        var config = await _configStore.LoadAsync();
-        var profiles = (await _profileStore.ListAsync()).ToDictionary(profile => profile.Name, StringComparer.Ordinal);
-        if (profiles.Count == 0)
-        {
-            throw new UserFacingException("No profiles saved. Use `codex-multi auth save <name>` first.");
-        }
-
-        var orderedProfiles = OrderProfiles(config, profiles.Keys);
-        if (orderedProfiles.Count == 0)
-        {
-            throw new UserFacingException("No profiles saved. Use `codex-multi auth save <name>` first.");
-        }
-
-        var currentProfile = ResolveInitialProfile(config, orderedProfiles);
+        var runId = CreateRunId();
         var exhaustedProfiles = new HashSet<string>(StringComparer.Ordinal);
+        var lease = await PrepareLaunchAsync(runId);
         SessionReference? sessionReference = null;
-        var isRetry = false;
 
         while (true)
         {
-            await ActivateProfileAsync(config, currentProfile);
+            _logger.Info($"Run '{runId}' launching with profile '{lease.ProfileName}' generation {lease.Generation}.");
 
-            if (isRetry)
-            {
-                Console.Error.WriteLine($"Rate limit detected. Switching to profile '{currentProfile}' and resuming.");
-            }
-
-            _logger.Info($"Using profile '{currentProfile}'.");
-
-            var watcher = new SessionLogWatcher(_configStore.Paths.CodexSessionsDirectory, _logger);
+            var watcher = new Sessions.SessionLogWatcher(_configStore.Paths.CodexSessionsDirectory, _logger);
             var processRunner = new CodexProcessRunner(_logger, watcher);
-
-            var launchPlan = isRetry
-                ? LaunchPlan.Resume(config.CodexExecutable, sessionReference!.SessionId, config.ResumePrompt)
-                : LaunchPlan.Raw(config.CodexExecutable, args);
+            var launchPlan = sessionReference is null
+                ? LaunchPlan.Raw(lease.CodexExecutable, args)
+                : LaunchPlan.Resume(lease.CodexExecutable, sessionReference.SessionId, lease.ResumePrompt);
 
             var result = await processRunner.RunAsync(launchPlan, sessionReference);
             if (!string.IsNullOrWhiteSpace(result.SessionId) && !string.IsNullOrWhiteSpace(result.RolloutPath))
@@ -71,61 +54,168 @@ internal sealed class CodexMultiRunner
 
             if (!result.RateLimitDetected)
             {
+                await FinalizeSuccessfulRunAsync(lease);
                 return result.ExitCode;
             }
 
-            exhaustedProfiles.Add(currentProfile);
-            _logger.Info($"Rate limit detected for profile '{currentProfile}'.");
+            exhaustedProfiles.Add(lease.ProfileName);
+            _logger.Info($"Run '{runId}' detected rate limit for profile '{lease.ProfileName}'.");
 
             if (sessionReference is null)
             {
                 throw new UserFacingException("Rate limit was detected, but the current session id could not be determined.");
             }
 
-            currentProfile = SelectNextProfile(orderedProfiles, currentProfile, exhaustedProfiles)
+            lease = await ResolveAfterRateLimitAsync(runId, lease, exhaustedProfiles);
+            Console.Error.WriteLine($"Rate limit detected. Using profile '{lease.ProfileName}' and resuming.");
+        }
+    }
+
+    private async Task<RunProfileLease> PrepareLaunchAsync(string runId)
+    {
+        using var stateLock = AcquireStateLock();
+
+        var config = await _configStore.LoadAsync();
+        var runtimeState = await _runtimeStateStore.LoadAsync();
+        var orderedProfiles = await LoadOrderedProfilesAsync(config);
+        var activeProfile = ResolveActiveProfile(config, runtimeState, orderedProfiles);
+
+        await EnsureSharedAuthForProfileAsync(activeProfile);
+
+        var configChanged = ApplyOrderedProfiles(config, orderedProfiles);
+        if (!string.Equals(config.ActiveProfile, activeProfile, StringComparison.Ordinal))
+        {
+            config.ActiveProfile = activeProfile;
+            configChanged = true;
+        }
+
+        var runtimeChanged = false;
+        if (!string.Equals(runtimeState.ActiveProfile, activeProfile, StringComparison.Ordinal))
+        {
+            runtimeState.ActiveProfile = activeProfile;
+            runtimeState.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            runtimeState.UpdatedByRunId = runId;
+            runtimeChanged = true;
+        }
+
+        if (configChanged)
+        {
+            await _configStore.SaveAsync(config);
+        }
+
+        if (runtimeChanged || !File.Exists(_runtimeStateStore.Paths.RuntimeStateFilePath))
+        {
+            await _runtimeStateStore.SaveAsync(runtimeState);
+        }
+
+        return CreateLease(config, runtimeState, activeProfile);
+    }
+
+    private async Task<RunProfileLease> ResolveAfterRateLimitAsync(
+        string runId,
+        RunProfileLease currentLease,
+        HashSet<string> exhaustedProfiles)
+    {
+        using var stateLock = AcquireStateLock();
+
+        var config = await _configStore.LoadAsync();
+        var runtimeState = await _runtimeStateStore.LoadAsync();
+        var orderedProfiles = await LoadOrderedProfilesAsync(config);
+        var activeProfile = ResolveActiveProfile(config, runtimeState, orderedProfiles);
+
+        var generationMatches = runtimeState.Generation == currentLease.Generation;
+        var profileMatches = string.Equals(runtimeState.ActiveProfile, currentLease.ProfileName, StringComparison.Ordinal);
+
+        if (generationMatches && profileMatches)
+        {
+            await _profileStore.SyncSharedAuthToProfileIfMatchesAsync(currentLease.ProfileName);
+
+            var nextProfile = SelectNextProfile(orderedProfiles, currentLease.ProfileName, exhaustedProfiles)
                 ?? throw new UserFacingException("All available profiles have been exhausted or failed with rate limits.");
 
-            isRetry = true;
+            await EnsureSharedAuthForProfileAsync(nextProfile);
+
+            runtimeState.ActiveProfile = nextProfile;
+            runtimeState.Generation++;
+            runtimeState.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            runtimeState.UpdatedByRunId = runId;
+
+            ApplyOrderedProfiles(config, orderedProfiles);
+            config.ActiveProfile = nextProfile;
+
+            await _configStore.SaveAsync(config);
+            await _runtimeStateStore.SaveAsync(runtimeState);
+
+            _logger.Info($"Run '{runId}' switched shared active profile from '{currentLease.ProfileName}' to '{nextProfile}'.");
+            return CreateLease(config, runtimeState, nextProfile);
         }
+
+        await EnsureSharedAuthForProfileAsync(activeProfile);
+
+        var configChanged = ApplyOrderedProfiles(config, orderedProfiles);
+        if (!string.Equals(config.ActiveProfile, activeProfile, StringComparison.Ordinal))
+        {
+            config.ActiveProfile = activeProfile;
+            configChanged = true;
+        }
+
+        if (configChanged)
+        {
+            await _configStore.SaveAsync(config);
+        }
+
+        _logger.Info(
+            $"Run '{runId}' detected that another instance already switched shared profile to '{activeProfile}' generation {runtimeState.Generation}.");
+
+        return CreateLease(config, runtimeState, activeProfile);
     }
 
-    private async Task ActivateProfileAsync(AppConfig config, string profileName)
+    private async Task FinalizeSuccessfulRunAsync(RunProfileLease lease)
     {
+        using var stateLock = AcquireStateLock();
+
+        var runtimeState = await _runtimeStateStore.LoadAsync();
+        if (runtimeState.Generation != lease.Generation ||
+            !string.Equals(runtimeState.ActiveProfile, lease.ProfileName, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        await _profileStore.SyncSharedAuthToProfileIfMatchesAsync(lease.ProfileName);
+    }
+
+    private async Task EnsureSharedAuthForProfileAsync(string profileName)
+    {
+        if (await _profileStore.SharedAuthMatchesProfileAsync(profileName))
+        {
+            await _profileStore.SyncSharedAuthToProfileIfMatchesAsync(profileName);
+            return;
+        }
+
         await _authSwitcher.SwitchToProfileAsync(profileName);
-        config.EnsureProfileRegistered(profileName);
-        config.ActiveProfile = profileName;
-        await _configStore.SaveAsync(config);
     }
 
-    private static List<string> OrderProfiles(AppConfig config, IEnumerable<string> availableProfiles)
+    private async Task<IReadOnlyList<string>> LoadOrderedProfilesAsync(AppConfig config)
     {
-        var ordered = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var available = new HashSet<string>(availableProfiles, StringComparer.Ordinal);
-
-        foreach (var profile in config.ProfileOrder)
+        var profiles = (await _profileStore.ListAsync()).Select(profile => profile.Name).ToArray();
+        if (profiles.Length == 0)
         {
-            if (available.Contains(profile) && seen.Add(profile))
-            {
-                ordered.Add(profile);
-            }
+            throw new UserFacingException("No profiles saved. Use `codex-multi auth save <name>` first.");
         }
 
-        foreach (var profile in available.OrderBy(profile => profile, StringComparer.Ordinal))
-        {
-            if (seen.Add(profile))
-            {
-                ordered.Add(profile);
-            }
-        }
-
-        config.ProfileOrder = ordered.ToList();
-        return ordered;
+        return OrderProfiles(config, profiles);
     }
 
-    private static string ResolveInitialProfile(AppConfig config, IReadOnlyList<string> orderedProfiles)
+    private static string ResolveActiveProfile(AppConfig config, RuntimeState runtimeState, IReadOnlyList<string> orderedProfiles)
     {
-        if (!string.IsNullOrWhiteSpace(config.ActiveProfile) && orderedProfiles.Contains(config.ActiveProfile, StringComparer.Ordinal))
+        if (!string.IsNullOrWhiteSpace(runtimeState.ActiveProfile) &&
+            orderedProfiles.Contains(runtimeState.ActiveProfile, StringComparer.Ordinal))
+        {
+            return runtimeState.ActiveProfile;
+        }
+
+        if (!string.IsNullOrWhiteSpace(config.ActiveProfile) &&
+            orderedProfiles.Contains(config.ActiveProfile, StringComparer.Ordinal))
         {
             return config.ActiveProfile;
         }
@@ -133,10 +223,34 @@ internal sealed class CodexMultiRunner
         return orderedProfiles[0];
     }
 
+    private static IReadOnlyList<string> OrderProfiles(AppConfig config, IReadOnlyList<string> availableProfiles)
+    {
+        var ordered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var profile in config.ProfileOrder)
+        {
+            if (availableProfiles.Contains(profile, StringComparer.Ordinal) && seen.Add(profile))
+            {
+                ordered.Add(profile);
+            }
+        }
+
+        foreach (var profile in availableProfiles.OrderBy(profile => profile, StringComparer.Ordinal))
+        {
+            if (seen.Add(profile))
+            {
+                ordered.Add(profile);
+            }
+        }
+
+        return ordered;
+    }
+
     private static string? SelectNextProfile(
         IReadOnlyList<string> orderedProfiles,
         string currentProfile,
-        HashSet<string> exhaustedProfiles)
+        IReadOnlySet<string> exhaustedProfiles)
     {
         var currentIndex = -1;
         for (var index = 0; index < orderedProfiles.Count; index++)
@@ -164,6 +278,46 @@ internal sealed class CodexMultiRunner
 
         return null;
     }
+
+    private static bool ApplyOrderedProfiles(AppConfig config, IReadOnlyList<string> orderedProfiles)
+    {
+        if (config.ProfileOrder.SequenceEqual(orderedProfiles, StringComparer.Ordinal))
+        {
+            return false;
+        }
+
+        config.ProfileOrder = orderedProfiles.ToList();
+        return true;
+    }
+
+    private static RunProfileLease CreateLease(AppConfig config, RuntimeState runtimeState, string profileName)
+    {
+        return new RunProfileLease(
+            profileName,
+            runtimeState.Generation,
+            config.CodexExecutable,
+            config.ResumePrompt);
+    }
+
+    private InstanceLock AcquireStateLock()
+    {
+        return InstanceLock.Acquire(
+            _configStore.Paths.StateLockFilePath,
+            "Another codex-multi instance is updating shared auth state. Please retry.",
+            StateLockTimeout);
+    }
+
+    private static string CreateRunId()
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        return $"{DateTimeOffset.UtcNow:yyyyMMddTHHmmssfffZ}-{Environment.ProcessId}-{suffix}";
+    }
 }
 
 internal sealed record SessionReference(string SessionId, string RolloutPath);
+
+internal sealed record RunProfileLease(
+    string ProfileName,
+    long Generation,
+    string CodexExecutable,
+    string ResumePrompt);

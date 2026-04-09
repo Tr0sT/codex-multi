@@ -112,6 +112,10 @@ internal sealed class SessionLogWatcher
             return null;
         }
 
+        JsonlSessionCandidate? bestCandidate = null;
+        string? bestPath = null;
+        TimeSpan? bestDelta = null;
+
         foreach (var filePath in EnumerateCandidateFiles(startedAtUtc))
         {
             var candidate = await JsonlSessionCandidate.TryLoadAsync(filePath);
@@ -130,8 +134,23 @@ internal sealed class SessionLogWatcher
                 continue;
             }
 
-            _logger.Info($"Matched rollout log '{filePath}'.");
-            return new JsonlSessionTail(filePath, candidate.SessionId, skipExistingContent: false);
+            var delta = candidate.StartedAtUtc - startedAtUtc;
+            var absoluteDelta = delta.Duration();
+
+            if (bestDelta is not null && absoluteDelta >= bestDelta.Value)
+            {
+                continue;
+            }
+
+            bestCandidate = candidate;
+            bestPath = filePath;
+            bestDelta = absoluteDelta;
+        }
+
+        if (bestCandidate is not null && bestPath is not null)
+        {
+            _logger.Info($"Matched rollout log '{bestPath}'.");
+            return new JsonlSessionTail(bestPath, bestCandidate.SessionId, skipExistingContent: false);
         }
 
         return null;

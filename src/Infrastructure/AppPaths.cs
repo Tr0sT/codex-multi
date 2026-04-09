@@ -12,7 +12,8 @@ internal sealed class AppPaths
         LocksDirectory = Path.Combine(ConfigDirectory, "locks");
 
         ConfigFilePath = Path.Combine(ConfigDirectory, "config.json");
-        InstanceLockFilePath = Path.Combine(LocksDirectory, "instance.lock");
+        RuntimeStateFilePath = Path.Combine(ConfigDirectory, "runtime.json");
+        StateLockFilePath = Path.Combine(LocksDirectory, "state.lock");
 
         CodexHomeDirectory = codexHomeDirectory;
         CodexAuthFilePath = Path.Combine(CodexHomeDirectory, "auth.json");
@@ -29,7 +30,9 @@ internal sealed class AppPaths
 
     public string ConfigFilePath { get; }
 
-    public string InstanceLockFilePath { get; }
+    public string RuntimeStateFilePath { get; }
+
+    public string StateLockFilePath { get; }
 
     public string CodexHomeDirectory { get; }
 

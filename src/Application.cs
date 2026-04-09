@@ -9,6 +9,8 @@ namespace CodexMulti;
 
 internal sealed class Application
 {
+    private static readonly TimeSpan StateLockTimeout = TimeSpan.FromSeconds(30);
+
     public async Task<int> RunAsync(string[] args)
     {
         var paths = AppPaths.Create();
@@ -16,6 +18,7 @@ internal sealed class Application
 
         var logger = new AppLogger(paths.LogsDirectory);
         var configStore = new AppConfigStore(paths);
+        var runtimeStateStore = new RuntimeStateStore(paths);
         var authInspector = new AuthInspector();
         var profileStore = new ProfileStore(paths, authInspector);
         var authSwitcher = new AuthJsonSwitcher(paths, authInspector);
@@ -25,8 +28,8 @@ internal sealed class Application
             var command = CliCommandParser.Parse(args);
             return command switch
             {
-                RunCommand runCommand => await HandleRunAsync(runCommand, configStore, profileStore, authSwitcher, logger),
-                AuthCommand authCommand => await HandleAuthAsync(authCommand, configStore, profileStore, authSwitcher),
+                RunCommand runCommand => await HandleRunAsync(runCommand, configStore, runtimeStateStore, profileStore, authSwitcher, logger),
+                AuthCommand authCommand => await HandleAuthAsync(authCommand, configStore, runtimeStateStore, profileStore, authSwitcher),
                 _ => throw new UserFacingException("Unsupported command."),
             };
         }
@@ -47,32 +50,33 @@ internal sealed class Application
     private static async Task<int> HandleRunAsync(
         RunCommand command,
         AppConfigStore configStore,
+        RuntimeStateStore runtimeStateStore,
         ProfileStore profileStore,
         AuthJsonSwitcher authSwitcher,
         AppLogger logger)
     {
-        using var instanceLock = InstanceLock.Acquire(configStore.Paths.InstanceLockFilePath);
-
-        var runner = new CodexMultiRunner(configStore, profileStore, authSwitcher, logger);
+        var runner = new CodexMultiRunner(configStore, runtimeStateStore, profileStore, authSwitcher, logger);
         return await runner.RunAsync(command.Args);
     }
 
     private static async Task<int> HandleAuthAsync(
         AuthCommand command,
         AppConfigStore configStore,
+        RuntimeStateStore runtimeStateStore,
         ProfileStore profileStore,
         AuthJsonSwitcher authSwitcher)
     {
         var config = await configStore.LoadAsync();
+        var runtimeState = await runtimeStateStore.LoadAsync();
 
         switch (command.Subcommand)
         {
             case AuthListCommand:
-                await PrintProfilesAsync(config, profileStore);
+                await PrintProfilesAsync(config, runtimeState, profileStore);
                 return 0;
 
             case AuthCurrentCommand:
-                await PrintCurrentProfileAsync(config, profileStore);
+                await PrintCurrentProfileAsync(config, runtimeState, profileStore);
                 return 0;
 
             case AuthShowCommand showCommand:
@@ -81,7 +85,7 @@ internal sealed class Application
 
             case AuthSaveCommand saveCommand:
             {
-                using var instanceLock = InstanceLock.Acquire(configStore.Paths.InstanceLockFilePath);
+                using var stateLock = AcquireStateLock(configStore.Paths);
                 var updatedConfig = await configStore.LoadAsync();
                 var metadata = await profileStore.SaveCurrentAuthAsync(saveCommand.Name);
                 updatedConfig.EnsureProfileRegistered(metadata.Name);
@@ -93,7 +97,7 @@ internal sealed class Application
 
             case AuthImportCommand importCommand:
             {
-                using var instanceLock = InstanceLock.Acquire(configStore.Paths.InstanceLockFilePath);
+                using var stateLock = AcquireStateLock(configStore.Paths);
                 var updatedConfig = await configStore.LoadAsync();
                 var metadata = await profileStore.ImportAsync(importCommand.Name, importCommand.SourcePath);
                 updatedConfig.EnsureProfileRegistered(metadata.Name);
@@ -105,24 +109,76 @@ internal sealed class Application
 
             case AuthUseCommand useCommand:
             {
-                using var instanceLock = InstanceLock.Acquire(configStore.Paths.InstanceLockFilePath);
+                using var stateLock = AcquireStateLock(configStore.Paths);
                 var updatedConfig = await configStore.LoadAsync();
+                var updatedRuntimeState = await runtimeStateStore.LoadAsync();
                 var metadata = await profileStore.GetRequiredAsync(useCommand.Name);
-                await authSwitcher.SwitchToProfileAsync(metadata.Name);
+                var matchesProfile = await profileStore.SharedAuthMatchesProfileAsync(metadata.Name);
+                if (matchesProfile)
+                {
+                    await profileStore.SyncSharedAuthToProfileIfMatchesAsync(metadata.Name);
+                }
+                else
+                {
+                    await authSwitcher.SwitchToProfileAsync(metadata.Name);
+                }
+
+                if (!string.Equals(updatedRuntimeState.ActiveProfile, metadata.Name, StringComparison.Ordinal))
+                {
+                    updatedRuntimeState.Generation++;
+                    updatedRuntimeState.UpdatedAtUtc = DateTimeOffset.UtcNow;
+                    updatedRuntimeState.UpdatedByRunId = "auth-use";
+                }
+
+                updatedRuntimeState.ActiveProfile = metadata.Name;
                 updatedConfig.EnsureProfileRegistered(metadata.Name);
                 updatedConfig.ActiveProfile = metadata.Name;
                 await configStore.SaveAsync(updatedConfig);
+                await runtimeStateStore.SaveAsync(updatedRuntimeState);
                 Console.WriteLine($"Active profile: {metadata.Name}");
                 return 0;
             }
 
             case AuthRemoveCommand removeCommand:
             {
-                using var instanceLock = InstanceLock.Acquire(configStore.Paths.InstanceLockFilePath);
+                using var stateLock = AcquireStateLock(configStore.Paths);
                 var updatedConfig = await configStore.LoadAsync();
+                var updatedRuntimeState = await runtimeStateStore.LoadAsync();
+                var removedWasActive = string.Equals(updatedRuntimeState.ActiveProfile, removeCommand.Name, StringComparison.Ordinal);
                 await profileStore.RemoveAsync(removeCommand.Name);
                 updatedConfig.RemoveProfile(removeCommand.Name);
+
+                if (removedWasActive)
+                {
+                    var remainingProfiles = (await profileStore.ListAsync())
+                        .Select(profile => profile.Name)
+                        .ToArray();
+
+                    var orderedProfiles = OrderProfileNames(updatedConfig, remainingProfiles);
+                    var nextProfile = orderedProfiles.FirstOrDefault();
+
+                    updatedRuntimeState.Generation++;
+                    updatedRuntimeState.UpdatedAtUtc = DateTimeOffset.UtcNow;
+                    updatedRuntimeState.UpdatedByRunId = "auth-remove";
+                    updatedRuntimeState.ActiveProfile = nextProfile;
+
+                    if (!string.IsNullOrWhiteSpace(nextProfile))
+                    {
+                        if (await profileStore.SharedAuthMatchesProfileAsync(nextProfile))
+                        {
+                            await profileStore.SyncSharedAuthToProfileIfMatchesAsync(nextProfile);
+                        }
+                        else
+                        {
+                            await authSwitcher.SwitchToProfileAsync(nextProfile);
+                        }
+
+                        updatedConfig.ActiveProfile = nextProfile;
+                    }
+                }
+
                 await configStore.SaveAsync(updatedConfig);
+                await runtimeStateStore.SaveAsync(updatedRuntimeState);
                 Console.WriteLine($"Removed profile '{removeCommand.Name}'.");
                 return 0;
             }
@@ -132,7 +188,7 @@ internal sealed class Application
         }
     }
 
-    private static async Task PrintProfilesAsync(AppConfig config, ProfileStore profileStore)
+    private static async Task PrintProfilesAsync(AppConfig config, RuntimeState runtimeState, ProfileStore profileStore)
     {
         var profiles = await profileStore.ListAsync();
         if (profiles.Count == 0)
@@ -141,16 +197,17 @@ internal sealed class Application
             return;
         }
 
+        var displayedActiveProfile = runtimeState.ActiveProfile ?? config.ActiveProfile;
         foreach (var profile in OrderProfiles(config, profiles))
         {
-            var activeMarker = string.Equals(profile.Name, config.ActiveProfile, StringComparison.Ordinal) ? "*" : " ";
+            var activeMarker = string.Equals(profile.Name, displayedActiveProfile, StringComparison.Ordinal) ? "*" : " ";
             Console.WriteLine($"{activeMarker} {FormatProfileSummary(profile)}");
         }
     }
 
-    private static async Task PrintCurrentProfileAsync(AppConfig config, ProfileStore profileStore)
+    private static async Task PrintCurrentProfileAsync(AppConfig config, RuntimeState runtimeState, ProfileStore profileStore)
     {
-        var activeProfileName = config.ActiveProfile;
+        var activeProfileName = runtimeState.ActiveProfile ?? config.ActiveProfile;
         if (string.IsNullOrWhiteSpace(activeProfileName))
         {
             Console.WriteLine("No active profile configured.");
@@ -202,8 +259,40 @@ internal sealed class Application
         return ordered;
     }
 
+    private static IReadOnlyList<string> OrderProfileNames(AppConfig config, IReadOnlyList<string> profiles)
+    {
+        var ordered = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var name in config.ProfileOrder)
+        {
+            if (profiles.Contains(name, StringComparer.Ordinal) && seen.Add(name))
+            {
+                ordered.Add(name);
+            }
+        }
+
+        foreach (var name in profiles.OrderBy(profile => profile, StringComparer.Ordinal))
+        {
+            if (seen.Add(name))
+            {
+                ordered.Add(name);
+            }
+        }
+
+        return ordered;
+    }
+
     private static string FormatProfileSummary(ProfileMetadata profile)
     {
         return $"{profile.Name} authMode={profile.AuthMode ?? "-"} accountId={profile.AccountId ?? "-"} emailHint={profile.EmailHint ?? "-"} savedAtUtc={profile.SavedAtUtc:O}";
+    }
+
+    private static InstanceLock AcquireStateLock(AppPaths paths)
+    {
+        return InstanceLock.Acquire(
+            paths.StateLockFilePath,
+            "Another codex-multi instance is updating shared auth state. Please retry.",
+            StateLockTimeout);
     }
 }

@@ -91,39 +91,47 @@ internal sealed class ProfileStore
         return Task.CompletedTask;
     }
 
+    public async Task<bool> SharedAuthMatchesProfileAsync(string name)
+    {
+        ValidateName(name);
+        var inspection = await TryInspectAuthFileAsync(_paths.CodexAuthFilePath);
+        if (inspection is null)
+        {
+            return false;
+        }
+
+        var profileInspection = await TryInspectProfileAsync(name);
+        return profileInspection is not null && MatchesProfile(profileInspection, inspection);
+    }
+
+    public async Task<bool> SyncSharedAuthToProfileIfMatchesAsync(string name)
+    {
+        ValidateName(name);
+
+        var inspection = await TryInspectAuthFileAsync(_paths.CodexAuthFilePath);
+        if (inspection is null)
+        {
+            return false;
+        }
+
+        var profileInspection = await TryInspectProfileAsync(name);
+        if (profileInspection is null || !MatchesProfile(profileInspection, inspection))
+        {
+            return false;
+        }
+
+        var authJson = await File.ReadAllTextAsync(_paths.CodexAuthFilePath, TextEncodings.Utf8NoBom);
+        await SaveAuthJsonAsync(name, authJson, inspection);
+        return true;
+    }
+
     private async Task<ProfileMetadata> SaveFromSourceAsync(string name, string sourcePath)
     {
         ValidateName(name);
 
         var authJson = await File.ReadAllTextAsync(sourcePath, TextEncodings.Utf8NoBom);
         var inspection = _authInspector.Inspect(authJson);
-
-        var profileDirectory = _paths.GetProfileDirectory(name);
-        Directory.CreateDirectory(profileDirectory);
-        FilePermissions.TrySetOwnerOnlyDirectory(profileDirectory);
-
-        var authFilePath = _paths.GetProfileAuthFilePath(name);
-        await File.WriteAllTextAsync(authFilePath, authJson, TextEncodings.Utf8NoBom);
-        FilePermissions.TrySetOwnerOnly(authFilePath);
-
-        var metadata = new ProfileMetadata
-        {
-            Name = name,
-            SavedAtUtc = DateTimeOffset.UtcNow,
-            AuthMode = inspection.AuthMode,
-            AccountId = inspection.AccountId,
-            EmailHint = inspection.EmailHint,
-        };
-
-        var metaFilePath = _paths.GetProfileMetaFilePath(name);
-        await using (var stream = new FileStream(metaFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
-        {
-            await JsonSerializer.SerializeAsync(stream, metadata, JsonOptions);
-            await stream.FlushAsync();
-        }
-
-        FilePermissions.TrySetOwnerOnly(metaFilePath);
-        return metadata;
+        return await SaveAuthJsonAsync(name, authJson, inspection);
     }
 
     private async Task<ProfileMetadata?> TryReadMetadataAsync(string name)
@@ -156,6 +164,59 @@ internal sealed class ProfileStore
             AccountId = inspection.AccountId,
             EmailHint = inspection.EmailHint,
         };
+    }
+
+    private async Task<AuthInspectionResult?> TryInspectProfileAsync(string name)
+    {
+        var authFilePath = _paths.GetProfileAuthFilePath(name);
+        return await TryInspectAuthFileAsync(authFilePath);
+    }
+
+    private async Task<AuthInspectionResult?> TryInspectAuthFileAsync(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        var authJson = await File.ReadAllTextAsync(path, TextEncodings.Utf8NoBom);
+        return _authInspector.Inspect(authJson);
+    }
+
+    private async Task<ProfileMetadata> SaveAuthJsonAsync(string name, string authJson, AuthInspectionResult inspection)
+    {
+        var profileDirectory = _paths.GetProfileDirectory(name);
+        Directory.CreateDirectory(profileDirectory);
+        FilePermissions.TrySetOwnerOnlyDirectory(profileDirectory);
+
+        var authFilePath = _paths.GetProfileAuthFilePath(name);
+        await File.WriteAllTextAsync(authFilePath, authJson, TextEncodings.Utf8NoBom);
+        FilePermissions.TrySetOwnerOnly(authFilePath);
+
+        var metadata = new ProfileMetadata
+        {
+            Name = name,
+            SavedAtUtc = DateTimeOffset.UtcNow,
+            AuthMode = inspection.AuthMode,
+            AccountId = inspection.AccountId,
+            EmailHint = inspection.EmailHint,
+        };
+
+        var metaFilePath = _paths.GetProfileMetaFilePath(name);
+        await using (var stream = new FileStream(metaFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            await JsonSerializer.SerializeAsync(stream, metadata, JsonOptions);
+            await stream.FlushAsync();
+        }
+
+        FilePermissions.TrySetOwnerOnly(metaFilePath);
+        return metadata;
+    }
+
+    private static bool MatchesProfile(AuthInspectionResult expected, AuthInspectionResult actual)
+    {
+        return !string.IsNullOrWhiteSpace(expected.AccountId) &&
+               string.Equals(expected.AccountId, actual.AccountId, StringComparison.Ordinal);
     }
 
     private static void ValidateName(string name)
